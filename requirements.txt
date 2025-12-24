@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+python-dotenv
+email-validator
+redis 
+kafka-python
+jwt
+datetime
+
+passlib==1.7.4
+bcrypt==4.1.2
