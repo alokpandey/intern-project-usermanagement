@@ -2,6 +2,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
 import os 
+import redis 
 
 load_dotenv()
 DATABASE_URL = os.getenv("DB_URL")
@@ -16,3 +17,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+redis_client = redis.Redis(host='localhost', port=6379)
+

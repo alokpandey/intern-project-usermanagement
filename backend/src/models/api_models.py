@@ -6,6 +6,11 @@ class UserData(BaseModel):
     email: str 
     password: str
 
+class UserLogin(BaseModel):
+    email: str 
+    password: str
+
+
 class SuccessResponse(BaseModel):
     message: str
     user_id: int
@@ -15,4 +20,6 @@ class ErrorResponse(BaseModel):
     status_code: int
     message: str
 
-
+class VerifyOTP(BaseModel):
+    user_id: int
+    otp: int

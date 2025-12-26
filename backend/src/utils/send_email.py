@@ -3,6 +3,7 @@ from email.message import EmailMessage
 from src.utils.otp_genrator import generate_otp
 import os 
 from dotenv import load_dotenv
+from ..session import redis_client
 
 load_dotenv()
 
@@ -33,6 +34,7 @@ def send_email_verification(email: str, user_id: int):
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
                 smtp.login(FROM, PASSWORD)
                 smtp.send_message(message)
+                redis_client.set(f"otp_{user_id}", otp, ex=120)
                 return True
     except Exception as e:
         print(e)
