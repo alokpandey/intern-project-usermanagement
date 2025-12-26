@@ -2,17 +2,18 @@ from app.utils.token_utils import validate_email, validate_password, get_hashed_
 from fastapi import FastAPI, Depends, HTTPException, Response, Request
 from sqlalchemy.orm import Session
 import datetime
-from app.config.settings import SESSION_TTL
+from app.config.settings import (EMAIL_HOST, EMAIL_PORT, SESSION_TTL, FRONT_END_URL, EMAIL_FROM,
+                                 RATE_LIMIT_RESET_PASSWORD, RATE_LIMIT_PERIOD_SECONDS,
+                                 RATE_LIMIT_LOGIN_ATTEMPTS, RATE_LIMIT_LOGIN_PERIOD_SECONDS)
+import smtplib
+from email.message import EmailMessage
 
 from app.db.database import get_db, init_db
 from app.db.models import Base, User
 from app.utils.kafka_producer import publish_event
 from app.db.schemas import UserCreate, UserLoginRequest
-from app.utils.redis_client import (create_email_verification_token, create_session, 
-                                    get_email_session, get_session, delete_session, use_email_token)
+from app.utils.redis_client import (create_session,  get_session, delete_session, check_rate_limit)
 
-
-from sqlalchemy.exc import OperationalError
 from datetime import datetime, timezone
 
 app = FastAPI()
@@ -29,30 +30,30 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email or username already registered")
 
-    is_valid_email = validate_email(user.email)
-    if not is_valid_email:
-        # update_request_info(redis_client, redis_key, "failed")
-        pass
+    validate_email(user.email)
+    validate_password(user.password)
     
-    is_valid_password = validate_password(user.password)
-    if not is_valid_password:
-        # update_request_info(redis_client, redis_key, "failed")
-        pass
-
-    encrypted_password = get_hashed_password(user.password)
-
     new_user = User(
         email=user.email,
         username=user.username,
-        hashed_password=encrypted_password
+        hashed_password=get_hashed_password(user.password)
     )
 
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
-    #send this token to the email
-    token = create_email_verification_token(new_user.id)
+    token = create_session(
+        {
+            "user_id": new_user.id,
+            "used": 0,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }, email_OTP=True
+    )
+
+    reset_link = f"{FRONT_END_URL}/verify-email?token={token}"
+    email_body = f"Click the following link to verify your email: {reset_link}"
+    send_email(to_email=user.email, subject="Verify Email", body=email_body)
     
     publish_event(
         "user_registered",
@@ -68,11 +69,17 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 @app.post("/login")
 def login(logIn: UserLoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
     
-    client_host = request.client.host
-
     if logIn.email is None and logIn.username is None:
         raise HTTPException(status_code=400, detail="Email or username required")
     
+    client_host = request.client.host
+    # ideally ip might be better, but for testing I will user email/username
+    # rate_limit_key = f"log_in_attempts:{client_host}" 
+    rate_limit_key = logIn.email if logIn.email else logIn.username
+
+    if not check_rate_limit(rate_limit_key, RATE_LIMIT_LOGIN_ATTEMPTS, RATE_LIMIT_LOGIN_PERIOD_SECONDS):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
+
     user = db.query(User).filter(
         (User.email == logIn.email) | (User.username == logIn.username)
     ).first()
@@ -84,10 +91,10 @@ def login(logIn: UserLoginRequest, request: Request, response: Response, db: Ses
         raise HTTPException(status_code=403, detail="Email not verified")
 
     if verify_password(logIn.password, user.hashed_password) == False:
-        user.failed_login_attempts += 1
+        # user.failed_login_attempts += 1
         raise HTTPException(status_code=401, detail="Invalid Password") #should i do password or credentials
     
-    user.failed_login_attempts = 0
+    # user.failed_login_attempts = 0
     
     session = create_session(
         {
@@ -95,7 +102,6 @@ def login(logIn: UserLoginRequest, request: Request, response: Response, db: Ses
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "ip": client_host
         }
-            #"user_agent": 
     )
 
     response.set_cookie(
@@ -119,7 +125,7 @@ def login(logIn: UserLoginRequest, request: Request, response: Response, db: Ses
         }
     )
     
-    return {"message": "Login successful", "session": session, "user": user.username, "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {"message": "Login successful", "user": user.username}
     
 @app.post("/logout")
 def logout(request: Request, response: Response):
@@ -153,9 +159,11 @@ def logout(request: Request, response: Response):
 
     return {"message": "Logged out"}
 
-@app.post("/verify-email")
+#get helps me just click the link, but post is more accurate for the change of user verification status
+#also what if user just never clicks the link, should I have a way to resend?
+@app.get("/verify-email")
 def verify_email(token: str, db: Session = Depends(get_db)):
-    email_session = get_email_session(token)
+    email_session = get_session(token)
     if not email_session:   
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
@@ -170,8 +178,7 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     user.is_verified = True
     db.commit()
 
-    # Invalidate token (Redis)
-    use_email_token(token)
+    delete_session(token)
     
     publish_event(
         "email_verified",
@@ -182,6 +189,81 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     )
     return {"message": "Email verified successfully"}
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.post("/password-reset/request")
+def request_password_reset(email: str, db: Session = Depends(get_db)):
+    rate_limit_key = f"pwd_reset:{email}"
+
+    if not check_rate_limit(rate_limit_key, RATE_LIMIT_RESET_PASSWORD, RATE_LIMIT_PERIOD_SECONDS):
+        raise HTTPException(status_code=429, detail="Too many password reset requests. Try again later.")
+
+    user = db.query(User).filter(User.email == email).first()
+
+    if user:
+        token = create_session(
+        {
+            "user_id": user.id,
+            "used": 0
+        }, pass_OTP=True
+    )
+
+        reset_link = f"{FRONT_END_URL}/password-reset?token={token}&"
+        reset_link = f"{FRONT_END_URL}/password-reset?token={token}&new_password=aSs2dfj83w@4jw03j" 
+        email_body = f"Add your password to the link above and click it to reset: {reset_link}"
+        send_email(to_email=user.email, subject="Password Reset Request", body=email_body)
+
+        publish_event(
+            "password_reset_requested",
+            {
+                "user_id": user.id,
+                "email": user.email,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        
+    return {"message": "If an account exists, a password reset email has been sent."}
+
+#get helps me just click the link, but post is more accurate for the change of user verification status
+@app.get("/password-reset")
+def password_reset(token: str, new_password: str, db: Session = Depends(get_db)):
+    
+    #doing this before lets me keep the token still reusable if the password is invalid
+    validate_password(new_password)
+    
+    session = get_session(token)
+    if not session:   
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    if session.get("used") == "1":
+        raise HTTPException(status_code=400, detail="Token already used")
+    
+    user = db.query(User).filter(User.id == session["user_id"]).first()
+
+    # if not user:
+    #     raise HTTPException(status_code=400, detail="User not found")
+    
+    user.hashed_password = get_hashed_password(new_password)
+    db.commit()
+
+    delete_session(token)
+    
+    publish_event(
+        "password_reset_completed",
+        {
+            "user_id": user.id,
+            "email": user.email #what should I log here?
+        }
+    )
+    return {"message": "Password reset successfully"}
+
+def send_email(to_email: str, subject: str, body: str):
+    msg = EmailMessage()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
+        server.send_message(msg)
+
+    # with smtplib.SMTP("mailhog", 1025) as server:
+    #     server.send_message(msg)

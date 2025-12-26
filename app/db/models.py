@@ -10,4 +10,4 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     
     is_verified = Column(Boolean, default=False)
-    failed_login_attempts = Column(Integer, default=0)
+    # failed_login_attempts = Column(Integer, default=0)
