@@ -46,6 +46,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     token = create_session(
         {
             "user_id": new_user.id,
+            "username": new_user.username,
             "used": 0,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }, email_OTP=True
@@ -56,22 +57,26 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     send_email(to_email=user.email, subject="Verify Email", body=email_body)
     
     publish_event(
-        "user_registered",
         {
-            "user_id": new_user.id,
-            "email": new_user.email,
-            "verified": False,
+            "username": new_user.username,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "operation": "successful_register"
         }
     )
 
-    return {"message": "User registered successfully", "token": token}
+    return {"message": "User registered successfully"}
 
 @app.post("/login")
 def login(logIn: UserLoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
-    
     if logIn.email is None and logIn.username is None:
+        
         raise HTTPException(status_code=400, detail="Email or username required")
     
+    session_id = request.cookies.get("session_id")
+
+    if session_id:
+        return {"message": "User already logged in"}
+
     client_host = request.client.host
     # ideally ip might be better, but for testing I will user email/username
     # rate_limit_key = f"log_in_attempts:{client_host}" 
@@ -88,17 +93,17 @@ def login(logIn: UserLoginRequest, request: Request, response: Response, db: Ses
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     if user.is_verified == False:
+        publish_event({"operation": "failed_login", "username": user.username,"timestamp": datetime.now(timezone.utc).isoformat(), "reason": "email_not_verified"})
         raise HTTPException(status_code=403, detail="Email not verified")
 
     if verify_password(logIn.password, user.hashed_password) == False:
-        # user.failed_login_attempts += 1
+        publish_event({"operation": "failed_login", "username": user.username,"timestamp": datetime.now(timezone.utc).isoformat(), "reason": "invalid_password"})
         raise HTTPException(status_code=401, detail="Invalid Password") #should i do password or credentials
-    
-    # user.failed_login_attempts = 0
     
     session = create_session(
         {
             "user_id": user.id,
+            "username": user.username,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "ip": client_host
         }
@@ -114,16 +119,7 @@ def login(logIn: UserLoginRequest, request: Request, response: Response, db: Ses
         path="/",
     )
 
-    publish_event(
-        "user_log_in_success",
-        {
-            "user_id": user.id,
-            "success": "success",
-            "email": user.email,
-            "ip": client_host,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    publish_event({"operation": "successful_login", "username": user.username,"timestamp": datetime.now(timezone.utc).isoformat()})
     
     return {"message": "Login successful", "user": user.username}
     
@@ -140,14 +136,7 @@ def logout(request: Request, response: Response):
     if session_data:
         delete_session(session_id)
 
-        publish_event(
-            "user_logout",
-            {
-                "user_id": session_data.get("user_id"),
-                "ip": request.client.host,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        publish_event({"operation": "successful_logout", "username": session_data.get("username"),"timestamp": datetime.now(timezone.utc).isoformat()})
 
     response.delete_cookie(
         key="session_id",
@@ -179,14 +168,9 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     db.commit()
 
     delete_session(token)
-    
-    publish_event(
-        "email_verified",
-        {
-            "user_id": user.id,
-            "email": user.email
-        }
-    )
+
+    publish_event({"operation": "email_verified", "username": email_session.get("username"),"timestamp": datetime.now(timezone.utc).isoformat()})
+
     return {"message": "Email verified successfully"}
 
 @app.post("/password-reset/request")
@@ -200,25 +184,20 @@ def request_password_reset(email: str, db: Session = Depends(get_db)):
 
     if user:
         token = create_session(
-        {
-            "user_id": user.id,
-            "used": 0
-        }, pass_OTP=True
-    )
+            {
+                "user_id": user.id,
+                "username": user.username,
+                "used": 0
+            }, pass_OTP=True
+        )
 
         reset_link = f"{FRONT_END_URL}/password-reset?token={token}&"
         reset_link = f"{FRONT_END_URL}/password-reset?token={token}&new_password=aSs2dfj83w@4jw03j" 
         email_body = f"Add your password to the link above and click it to reset: {reset_link}"
         send_email(to_email=user.email, subject="Password Reset Request", body=email_body)
 
-        publish_event(
-            "password_reset_requested",
-            {
-                "user_id": user.id,
-                "email": user.email,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        publish_event({"operation": "password_reset_requested", "username": user.username,"timestamp": datetime.now(timezone.utc).isoformat()})
+
         
     return {"message": "If an account exists, a password reset email has been sent."}
 
@@ -245,14 +224,9 @@ def password_reset(token: str, new_password: str, db: Session = Depends(get_db))
     db.commit()
 
     delete_session(token)
-    
-    publish_event(
-        "password_reset_completed",
-        {
-            "user_id": user.id,
-            "email": user.email #what should I log here?
-        }
-    )
+
+    publish_event({"operation": "successful_password_reset", "username": user.username,"timestamp": datetime.now(timezone.utc).isoformat()})
+
     return {"message": "Password reset successfully"}
 
 def send_email(to_email: str, subject: str, body: str):

@@ -1,11 +1,7 @@
 import secrets
 import redis
-from app.config.settings import REDIS_HOST, REDIS_PORT, SESSION_TTL, EMAIL_VERIFY_TTL_SECONDS, PASS_VERIFY_TTL_SECONDS
-
+from app.config.settings import REDIS_HOST, REDIS_PORT, SESSION_TTL, PASS_VERIFY_TTL_SECONDS #, EMAIL_VERIFY_TTL_SECONDS
 import uuid
-import json
-from datetime import datetime, timedelta
-import hashlib
 
 redis_client = redis.Redis(
     host=REDIS_HOST,
@@ -29,7 +25,8 @@ def create_session(session_data: dict, email_OTP: bool = False, pass_OTP: bool =
 
     #Set TTL
     if email_OTP:
-        redis_client.expire(session_key, EMAIL_VERIFY_TTL_SECONDS)
+        # redis_client.expire(session_key, EMAIL_VERIFY_TTL_SECONDS)
+        pass
     elif pass_OTP:
         redis_client.expire(session_key, PASS_VERIFY_TTL_SECONDS)
     else:
