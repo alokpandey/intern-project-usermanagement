@@ -9,7 +9,6 @@ load_dotenv()
 
 sender_email = os.getenv("SENDER_EMAIL")
 email_password = os.getenv("EMAIL_PASSWORD")
-print(email_password)
 
 def send_email_verification(email: str, user_id: int):
     otp = generate_otp()

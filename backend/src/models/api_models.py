@@ -1,12 +1,12 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 class UserData(BaseModel):
     username: str
-    email: str 
+    email: EmailStr 
     password: str
 
 class UserLogin(BaseModel):
-    email: str 
+    email: EmailStr
     password: str
 
 class SuccessResponse(BaseModel):
@@ -23,7 +23,7 @@ class VerifyOTP(BaseModel):
     otp: int
 
 class ForgotPasswordRequest(BaseModel):
-    email: str
+    email: EmailStr
 
 class ResetPasswordRequest(BaseModel):
     password: str

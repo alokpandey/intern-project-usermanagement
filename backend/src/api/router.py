@@ -11,6 +11,8 @@ from src.utils.send_email import send_email_verification, send_password_reset_em
 from ..session import redis_client
 import secrets
 from ..kafka_pc.kafka_producer import send_message
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from src.utils.password_validator import validate_password
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -18,28 +20,22 @@ logger.setLevel(logging.INFO)
 
 router = APIRouter()
 
-postgres_url = "postgresql://admin:admin@localhost:5432/mydb"
 special_chars = "#@!%&*"
-
 
 @router.post("/register")
 async def register(user : UserData, db: Session = Depends(get_db)):
     if not user.username  or not user.email or not user.password or user.email.endswith("@gmail.com") == False or not user.username.isalpha():
         logger.error("Invalid input")
-        respose = ErrorResponse(status_code=status.HTTP_400_BAD_REQUEST, message="Invalid input")
-        return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_400_BAD_REQUEST)    
+        response = ErrorResponse(status_code=status.HTTP_400_BAD_REQUEST, message="Invalid input")
+        return JSONResponse(content=response.model_dump(), status_code=status.HTTP_400_BAD_REQUEST)    
 
-    elif ( len(user.password) < 8 or not any(char in special_chars for char in user.password) or not any(char.isdigit() for char in user.password) or not any(char.isupper() for char in user.password)): 
+    elif not validate_password(user.password):
         logger.error("PASSWORD NOT STRONG!!!")
-        respose = ErrorResponse(status_code=status.HTTP_406_NOT_ACCEPTABLE, message=f""" * Password should be minimum 8 characters.
+        response = ErrorResponse(status_code=status.HTTP_406_NOT_ACCEPTABLE, message=f""" * Password should be minimum 8 characters.
                                 * Password should contain atleast one special character.  
                                 * Password should contaian One digit, and one uppercase letter.""")
-        return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_406_NOT_ACCEPTABLE)
+        return JSONResponse(content=response.model_dump(), status_code=status.HTTP_406_NOT_ACCEPTABLE)
     
-    elif db.query(User).filter(User.email == user.email).first() or db.query(User).filter(User.username == user.username).first():
-        logger.error("User already exists")
-        respose = ErrorResponse(status_code=status.HTTP_409_CONFLICT, message="User already exists")
-        return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_409_CONFLICT)
     
     else:   
         try:
@@ -61,88 +57,138 @@ async def register(user : UserData, db: Session = Depends(get_db)):
             email_status=send_email_verification(new_user.email, new_user.id)
             if email_status == False:
                 logger.error("Error sending email")
-                respose = ErrorResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message="Error sending email")
-                return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                response = ErrorResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message="Error sending email")
+                return JSONResponse(content=response.model_dump(), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        except IntegrityError as e:
+            db.rollback()
+            logger.error(f"Integrity error: {e}")
+            response = ErrorResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                message="User already exists"
+            )
+            return JSONResponse(content=response.model_dump(), status_code=409)
+
+        except SQLAlchemyError as e:
+            db.rollback()
+            logger.error(f"Database error: {e}")
+            response = ErrorResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message="Database error"
+            )
+            return JSONResponse(content=response.model_dump(), status_code=500)
 
         except Exception as e:
-            logger.error(f"Error adding user to database: {e}")
-            respose = ErrorResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message="Error adding user to database")
-            return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    respose=SuccessResponse(message="User registered successfully. Please verify your email.", user_id=new_user.id, verification_required=True)
-    return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_201_CREATED)
+            db.rollback()
+            logger.error(f"Unexpected error: {e}")
+            response = ErrorResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message="Registration failed"
+            )
+            return JSONResponse(content=response.model_dump(), status_code=500)
+    response = SuccessResponse(message="User created successfully", user_id=new_user.id, verification_required=True)
+    return JSONResponse(content=response.model_dump(), status_code=status.HTTP_201_CREATED)
 
 
 @router.post("/verify/otp")
 async def login(data : VerifyOTP, db: Session = Depends(get_db)):
     if data.user_id == "" or data.otp == "":
         logger.error("Invalid input")
-        respose = ErrorResponse(status_code=status.HTTP_400_BAD_REQUEST, message="Invalid input")
-        return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_400_BAD_REQUEST)
+        response = ErrorResponse(status_code=status.HTTP_400_BAD_REQUEST, message="Invalid input")
+        return JSONResponse(content=response.model_dump(), status_code=status.HTTP_400_BAD_REQUEST)
     else:
         try:
-            otp = redis_client.get(f"otp_{data.user_id}")
+            lock_key = f"lock_user:{data.user_id}"
+            rate_limit_key = f"rate_limit:{data.user_id}"
+            otp_key = f"otp_{data.user_id}"
+
+            if redis_client.exists(lock_key):
+                logger.error("User temporarily locked")
+                response = ErrorResponse(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    message="Too many attempts. Try again later."
+                )
+                return JSONResponse(content=response.model_dump(), status_code=429)
+            attempts = redis_client.get(rate_limit_key)
+            if attempts and int(attempts) >= 3:
+                redis_client.setex(lock_key, 120, "locked")
+                redis_client.delete(rate_limit_key)
+                logger.error("Too many attempts")
+                response = ErrorResponse(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    message="Too many attempts"
+                )
+                return JSONResponse(content=response.model_dump(), status_code=429)
+            otp = redis_client.get(otp_key)
+
             if otp is None:
                 logger.error("OTP expired")
-                respose = ErrorResponse(status_code=status.HTTP_400_BAD_REQUEST, message="OTP expired")
-                return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_400_BAD_REQUEST)
-            else:
-                if int(otp) == data.otp:
-                    redis_client.delete(f"otp_{data.user_id}")
-                    db.query(User).filter(User.id == data.user_id).update({"is_verified": True})
-                    db.commit()
-                    return {"message" : "OTP verified successfully"}
-                else:
-                    logger.error("Invalid OTP")
-                    respose = ErrorResponse(status_code=status.HTTP_400_BAD_REQUEST, message="Invalid OTP")
-                    return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_400_BAD_REQUEST)
+                response = ErrorResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="OTP expired"
+                )
+                return JSONResponse(content=response.model_dump(), status_code=400)
+            if otp.decode() == str(data.otp):
+                redis_client.delete(otp_key)
+                redis_client.delete(rate_limit_key)
+                updated = db.query(User).filter(User.id == data.user_id).update({"is_verified": True})
+                db.commit()
+                if not updated:
+                    logger.error("User not found")
+                    response = ErrorResponse(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        message="User not found"
+                    )
+                    return JSONResponse(content=response.model_dump(), status_code=404)
+                return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "OTP verified successfully"})
+            attempts = redis_client.incr(rate_limit_key)
+            if attempts == 1:
+                redis_client.expire(rate_limit_key, 300)
+
+            logger.error("Invalid OTP")
+            response = ErrorResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="Invalid OTP"
+            )
+            return JSONResponse(content=response.model_dump(), status_code=400)
         except Exception as e:
             logger.error(f"Error verifying OTP: {e}")
-            respose = ErrorResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message="Error verifying OTP")
-            return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            response = ErrorResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message="Error verifying OTP")
+            return JSONResponse(content=response.model_dump(), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @router.post("/login")
 async def login(data : UserLogin, db: Session = Depends(get_db)):
     if data.email == "" or data.password == "":
         logger.error("Invalid input")
-        respose = ErrorResponse(status_code=status.HTTP_400_BAD_REQUEST, message="Invalid input")
-        return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_400_BAD_REQUEST)
+        response = ErrorResponse(status_code=status.HTTP_400_BAD_REQUEST, message="Invalid input")
+        return JSONResponse(content=response.model_dump(), status_code=status.HTTP_400_BAD_REQUEST)
     else:
         try: 
             user = db.query(User).filter(User.email == data.email).first()
-            if not user:
+            if not user or not user.is_verified or not user.is_active:
                 logger.error("User does not exist")
-                respose = ErrorResponse(status_code=status.HTTP_404_NOT_FOUND, message="User does not exist")
-                return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_404_NOT_FOUND)
-            if not user.is_verified:
-                logger.error("User is not verified")
-                respose = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="User is not verified")
-                return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
-            if not user.is_active:
-                logger.error("User is not active")
-                respose = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="User is not active")
-                return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
-            is_locked = redis_client.get(f"lock_user:{user.id}")
-            if is_locked:
-                logger.error("User is locked")
-                respose = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="User is locked")
-                return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
-            if user.failed_login_attempts >= 3:
-                logger.error("User is locked")
-                respose = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="User is locked")
-                return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
-            if not check_password(data.password, user.password_hash):
-                user.failed_login_attempts += 1
-                db.commit()
-                logger.error("Invalid Credentials")
-                if user.failed_login_attempts >= 3:
-                    redis_client.setex(f"lock_user:{user.id}", 120, str(user.id))
-                    user.failed_login_attempts = 0
-                db.commit()
-                logger.error("User is locked")
-                respose = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="Invalid Credentials")
-                return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
+                response = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="Login Failed")
+                return JSONResponse(content=response.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
+        
+            if redis_client.exists(f"lock_user:{user.id}"):
+                response = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="Login Failed !!! User is locked")
+                return JSONResponse(content=response.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
             
+            if not check_password(data.password, user.password_hash):
+                attempts = redis_client.incr(f"login_attempts:{user.id}")
+                redis_client.expire(f"login_attempts:{user.id}", 300)
+                if attempts >= 3:
+                    redis_client.setex(f"lock_user:{user.id}", 120, str(user.id))
+                    logger.error("User is locked")
+                    redis_client.delete(f"login_attempts:{user.id}")
+                    response = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="Login Failed ")
+                    return JSONResponse(content=response.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
+                logger.error("Invalid Credentials")
+                response = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="Login Failed")
+                return JSONResponse(content=response.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
+            
+            redis_client.delete(f"login_attempts:{user.id}")
             session_id = "session_id"+ str(user.id)
             redis_client.setex(
                 f"session:{session_id}",
@@ -158,14 +204,11 @@ async def login(data : UserLogin, db: Session = Depends(get_db)):
                 samesite="lax",
                 max_age=3600
             )        
-            user.failed_login_attempts = 0 
-            db.commit()
-            logger.info("Login successful")
             return response
         except Exception as e:
             logger.error(f"Error logging in: {e}")
-            respose = ErrorResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message="Error logging in")
-            return JSONResponse(content=respose.model_dump(), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) 
+            response = ErrorResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message="Error logging in")
+            return JSONResponse(content=response.model_dump(), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) 
 
 
 @router.post("/logout")
@@ -210,25 +253,35 @@ async def reset_password(token: str, password: ResetPasswordRequest, db: Session
         return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"message": "Invalid token"})
     else:
         user = db.query(User).filter(User.id == int(user_id)).first()
-        if not user:
+        if not user or not user.is_verified :
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"message": "Invalid token"})
         try:
-            if (len(password.password) < 8 or not any(char in special_chars for char in password.password) or not any(char.isdigit() for char in password.password) or not any(char.isupper() for char in password.password)):
-                content = {"message": "Password is not strong enough"
-                "* Password should be minimum 8 characters."
-                "* Password should contain atleast one special character.  "
-                "* Password should contaian One digit, and one uppercase letter."}
+            if not validate_password(password.password):
+                content = {
+                "message": (
+                    "Password is not strong enough. "
+                    "Password should be minimum 8 characters. "
+                    "Password should contain at least one special character. "
+                    "Password should contain one digit and one uppercase letter."
+                )
+            }
                 return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=content)
-            elif hash_password(password.password) == user.password_hash:
+            if check_password(password.password, user.password_hash):
                 return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"message": "New password cannot be same as old password"})
-            else:
-                password_hashed =  hash_password(password.password)
-                user.password_hash = password_hashed
-                db.commit()
+
+            password_hashed =  hash_password(password.password)
+            user.password_hash = password_hashed
+            db.commit()
             redis_client.delete(f"password_reset:{token}")
             redis_client.delete(f"session:session_id{user_id}")
             redis_client.delete(f"otp_{user_id}")
             redis_client.delete(f"password_reset:{token}")
             return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "Password reset successful"})
+        except SQLAlchemyError as e:
+            db.rollback()
+            logger.error(f"Database error resetting password for user_id={user_id}: {e}")
+            return JSONResponse(status_code=500, content={"message": "Internal server error"})
+
         except Exception as e:
-            print(e)
+            logger.error(f"Unexpected error resetting password for user_id={user_id}: {e}")
+            return JSONResponse(status_code=500, content={"message": "Internal server error"})
