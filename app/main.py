@@ -75,7 +75,7 @@ def login(logIn: UserLoginRequest, request: Request, response: Response, db: Ses
     session_id = request.cookies.get("session_id")
 
     if session_id:
-        return {"message": "User already logged in"}
+        return {"message": "A User already logged in"}
 
     client_host = request.client.host
     # ideally ip might be better, but for testing I will user email/username
@@ -86,7 +86,8 @@ def login(logIn: UserLoginRequest, request: Request, response: Response, db: Ses
         raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
 
     user = db.query(User).filter(
-        (User.email == logIn.email) | (User.username == logIn.username)
+        (User.email == logIn.email) | (User.username == logIn.username),
+        # (User.is_deleted == False)
     ).first()
 
     if not user:
@@ -100,6 +101,9 @@ def login(logIn: UserLoginRequest, request: Request, response: Response, db: Ses
         publish_event({"operation": "failed_login", "username": user.username,"timestamp": datetime.now(timezone.utc).isoformat(), "reason": "invalid_password"})
         raise HTTPException(status_code=401, detail="Invalid Password") #should i do password or credentials
     
+    user.last_login = datetime.now(timezone.utc)
+    db.commit()
+
     session = create_session(
         {
             "user_id": user.id,
@@ -159,7 +163,9 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     if email_session.get("used") == "1":
         raise HTTPException(status_code=400, detail="Token already used")
     
-    user = db.query(User).filter(User.id == email_session["user_id"]).first()
+    user = db.query(User).filter(User.id == email_session["user_id"],
+                                 # (User.is_deleted == False)
+                                ).first()
 
     # if not user:
     #     raise HTTPException(status_code=400, detail="User not found")
@@ -180,7 +186,10 @@ def request_password_reset(email: str, db: Session = Depends(get_db)):
     if not check_rate_limit(rate_limit_key, RATE_LIMIT_RESET_PASSWORD, RATE_LIMIT_PERIOD_SECONDS):
         raise HTTPException(status_code=429, detail="Too many password reset requests. Try again later.")
 
-    user = db.query(User).filter(User.email == email).first()
+    user = db.query(User).filter(
+        User.email == email,
+        # (User.is_deleted == False)
+    ).first()
 
     if user:
         token = create_session(
@@ -215,7 +224,10 @@ def password_reset(token: str, new_password: str, db: Session = Depends(get_db))
     if session.get("used") == "1":
         raise HTTPException(status_code=400, detail="Token already used")
     
-    user = db.query(User).filter(User.id == session["user_id"]).first()
+    user = db.query(User).filter(
+        User.id == session["user_id"],
+        # (User.is_deleted == False)
+    ).first()
 
     # if not user:
     #     raise HTTPException(status_code=400, detail="User not found")

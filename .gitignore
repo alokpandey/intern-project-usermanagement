@@ -11,6 +11,13 @@ __pycache__/
 venv/
 env/
 
+# Environment variables
+.env
+.env.*
+
+# Local databases
+*.db
+
 # Editor / OS noise
 .vscode/
 .DS_Store
