@@ -6,7 +6,6 @@ import redis
 
 load_dotenv()
 DATABASE_URL = os.getenv("DB_URL")
-print(DATABASE_URL)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -19,5 +18,5 @@ def get_db():
         db.close()
 
 
-redis_client = redis.Redis(host='localhost', port=6379)
+redis_client = redis.Redis(host='redis', port=6379)
 
