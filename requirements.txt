@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+python-dotenv
+email-validator
+redis 
+kafka-python
+
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+
+pytest
+pytest-asyncio
+httpx
