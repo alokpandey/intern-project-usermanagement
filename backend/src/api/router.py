@@ -10,6 +10,7 @@ from fastapi import Request
 from src.utils.send_email import send_email_verification, send_password_reset_email
 from ..session import redis_client
 import secrets
+from datetime import datetime
 from ..kafka_pc.kafka_producer import send_message
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from src.utils.password_validator import validate_password
@@ -19,8 +20,6 @@ logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 
 router = APIRouter()
-
-special_chars = "#@!%&*"
 
 @router.post("/register")
 async def register(user : UserData, db: Session = Depends(get_db)):
@@ -86,8 +85,8 @@ async def register(user : UserData, db: Session = Depends(get_db)):
                 message="Registration failed"
             )
             return JSONResponse(content=response.model_dump(), status_code=500)
-    response = SuccessResponse(message="User created successfully", user_id=new_user.id, verification_required=True)
-    return JSONResponse(content=response.model_dump(), status_code=status.HTTP_201_CREATED)
+        response = SuccessResponse(message="User created successfully", user_id=new_user.id, verification_required=True)
+        return JSONResponse(content=response.model_dump(), status_code=status.HTTP_201_CREATED)
 
 
 @router.post("/verify/otp")
@@ -140,6 +139,12 @@ async def login(data : VerifyOTP, db: Session = Depends(get_db)):
                         message="User not found"
                     )
                     return JSONResponse(content=response.model_dump(), status_code=404)
+                user = db.query(User).filter(User.id == data.user_id).first()
+                if user:
+                    user_name = db.query(User).filter(User.id == data.user_id).first().username
+                    audit_data = {"username": user_name,"operation": "OTP_Verified","timestamp": str(datetime.now())}
+                    logger.info(f"send message to kafka: {audit_data}")
+                    send_message(audit_data)
                 return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "OTP verified successfully"})
             attempts = redis_client.incr(rate_limit_key)
             if attempts == 1:
@@ -182,6 +187,10 @@ async def login(data : UserLogin, db: Session = Depends(get_db)):
                     redis_client.setex(f"lock_user:{user.id}", 120, str(user.id))
                     logger.error("User is locked")
                     redis_client.delete(f"login_attempts:{user.id}")
+                    user_name = user.username
+                    audit_data = {"username": user_name,"operation": "LOGIN_LOCKED","timestamp": str(datetime.now())}
+                    logger.info(f"send message to kafka: {audit_data}")
+                    send_message(audit_data)
                     response = ErrorResponse(status_code=status.HTTP_401_UNAUTHORIZED, message="Login Failed ")
                     return JSONResponse(content=response.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
                 logger.error("Invalid Credentials")
@@ -189,12 +198,18 @@ async def login(data : UserLogin, db: Session = Depends(get_db)):
                 return JSONResponse(content=response.model_dump(), status_code=status.HTTP_401_UNAUTHORIZED)
             
             redis_client.delete(f"login_attempts:{user.id}")
-            session_id = "session_id"+ str(user.id)
+            session_id = secrets.token_urlsafe(32)
             redis_client.setex(
                 f"session:{session_id}",
                 3600,
                 str(user.id)
             )
+            redis_client.sadd(f"user_sessions:{user.id}", session_id)
+            redis_client.expire(f"user_sessions:{user.id}", 3600)
+            user_name = user.username
+            audit_data = {"username": user_name,"operation": "LogIn","timestamp": str(datetime.now())}
+            logger.info(f"send message to kafka: {audit_data}")
+            send_message(audit_data)
             response =  JSONResponse(status_code=status.HTTP_200_OK, content={"message": "Login successful"} )   
             response.set_cookie(
                 key="session_id",
@@ -210,9 +225,8 @@ async def login(data : UserLogin, db: Session = Depends(get_db)):
             response = ErrorResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message="Error logging in")
             return JSONResponse(content=response.model_dump(), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) 
 
-
 @router.post("/logout")
-async def logout(request: Request):
+async def logout(request: Request, db: Session = Depends(get_db)):
     session_id = request.cookies.get("session_id")
 
     if not session_id:
@@ -220,8 +234,21 @@ async def logout(request: Request):
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"message": "No active session"}
         )
-
+    
+    user_id = redis_client.get(f"session:{session_id}")
+    if not user_id:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"message": "No active session"}
+        )
     redis_client.delete(f"session:{session_id}")
+    redis_client.srem(f"user_sessions:{user_id.decode()}", session_id)  
+    user = db.query(User).filter(User.id == int(user_id.decode())).first()
+    if user:
+        user_name = db.query(User).filter(User.id == int(user_id.decode())).first().username
+        audit_data = {"username": user_name,"operation": "LogOUT","timestamp": str(datetime.now())}
+        logger.info(f"send message to kafka: {audit_data}")
+        send_message(audit_data)
     response = JSONResponse(status_code=status.HTTP_200_OK, content={"message": "Logout successful"})
     response.delete_cookie("session_id")
     return response
@@ -248,10 +275,11 @@ async def reset_password( data: ForgotPasswordRequest, db: Session = Depends(get
 
 @router.post("/reset/password/{token}")
 async def reset_password(token: str, password: ResetPasswordRequest, db: Session = Depends(get_db)):
-    user_id = redis_client.get(f"password_reset:{token}")
+    user_id= redis_client.get(f"password_reset:{token}")
     if user_id is None:
         return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"message": "Invalid token"})
     else:
+        user_id = user_id.decode()
         user = db.query(User).filter(User.id == int(user_id)).first()
         if not user or not user.is_verified :
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"message": "Invalid token"})
@@ -272,10 +300,21 @@ async def reset_password(token: str, password: ResetPasswordRequest, db: Session
             password_hashed =  hash_password(password.password)
             user.password_hash = password_hashed
             db.commit()
+            user_name = user.username
+            audit_data = {"username": user_name,"operation": "Password_Reset","timestamp": str(datetime.now())}
+            logger.info(f"send message to kafka: {audit_data}")
+            send_message(audit_data)
+            user_sessions = redis_client.smembers(f"user_sessions:{user_id}")
+            if user_sessions:
+                for session in user_sessions:
+                    redis_client.delete(f"session:{session.decode()}")
+
+            redis_client.delete(f"user_sessions:{user_id}")
             redis_client.delete(f"password_reset:{token}")
-            redis_client.delete(f"session:session_id{user_id}")
             redis_client.delete(f"otp_{user_id}")
-            redis_client.delete(f"password_reset:{token}")
+            redis_client.delete(f"login_attempts:{user_id}")
+            redis_client.delete(f"lock_user:{user_id}")
+            
             return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "Password reset successful"})
         except SQLAlchemyError as e:
             db.rollback()

@@ -43,7 +43,6 @@ services:
   #   depends_on:
   #     - postgres
 
-  # Redis
   redis:
     image: redis:8.0.5
     container_name: redis
@@ -64,7 +63,6 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
 

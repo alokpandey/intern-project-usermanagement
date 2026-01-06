@@ -20,24 +20,10 @@ class User(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 
-class EmailVerificationToken(Base):
-    __tablename__ = "email_verification_tokens"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-
-    token = Column(String, nullable=False, unique=True, index=True)
-    is_used = Column(Boolean, default=False, nullable=False)
-
-    expires_at = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    user = relationship("User", backref="verification_tokens")
-
 
 class Audit(Base):
     __tablename__ = "audit"
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), nullable=False, unique=True, index=True)
+    username = Column(String(50), nullable=False, unique=False, index=True)
     operation = Column(String(50), nullable=False)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
