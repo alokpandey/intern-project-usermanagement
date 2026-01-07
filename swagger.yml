@@ -1,0 +1,129 @@
+openapi: 3.0.0
+info:
+  title: Welcome to User Portal
+  description: A sample API to illustrate OAS YAML for endpoints.
+  version: 1.0.0
+
+paths:
+  /:
+    get:
+      summary: "default endpoint."
+      description: "Will print a welcome message."
+      responses: 
+        '200':
+          description: "A successful response, indicationg that the application is running"
+          content: 
+            application/json: 
+              schema:
+                  $ref: '#/components/schemas/SuccessResonse'
+              example:
+                message: "Welcome to User Portal"
+        '500': 
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 500 
+                message: "Service is Unavailable"
+    
+  /v1/api/register:
+    post:
+      summary: "Registration Endpoint"
+      description: "endpoint for registering User Sign-Up"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+              
+      responses: 
+        '201':
+          description: Registration Successful
+          content: 
+            application/json: 
+              schema: 
+                $ref: '#/components/schemas/SuccessResonse'
+              example:
+                message: registartion successful
+                user_id: 123
+                verification_required: True
+        '400':
+          description: Invalid request data
+          content: 
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 400 
+                message: Enter Valid details
+
+        '409':
+          description: Email already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code:  409 
+                message: "Enter Correct Details"
+
+        
+        '500':
+          description: Inernal Server error
+          content: 
+            application/json: 
+              schema: 
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code:  500 
+                message: "Service is Unavailable"
+
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      properties: 
+        status_code:
+          type: integer
+          example: 500
+        message: 
+          type: string
+          example: "Server Error"
+    
+    SuccessResonse:
+      type: 
+        object
+      properties: 
+        message:
+          type: string
+          example: "User registered successfully. Please verify your email."
+        user_id:
+          type: integer
+          example: 123
+        verification_required:
+          type: boolean
+          example: true
+        
+    RegisterRequest:
+      type: object
+      required:
+        - username
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        password:
+          type: string
+          example: "mypassword123"
+        username:
+          type: string
+          example: "Sandesh Gowda"
+            
+
+
