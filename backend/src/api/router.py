@@ -256,20 +256,63 @@ async def logout(request: Request, db: Session = Depends(get_db)):
 
 @router.post("/forgot/password")
 async def reset_password( data: ForgotPasswordRequest, db: Session = Depends(get_db)):
+
+      block_key = f"password_reset_block:{data.email}"
+      attempts_key = f"password_reset_attempts:{data.email}"
+   
+      if redis_client.exists(block_key):
+        response = {"message": "If an account exists, a password reset link has been sent."}
+        return JSONResponse(status_code=status.HTTP_200_OK, content=response)
+      
+      
+      attempts = redis_client.get(attempts_key)
+      if attempts and int(attempts) >= 3:
+        user = db.query(User).filter(User.email == data.email).first()
+        if user:
+            old_token_key = f"password_reset_user:{user.id}"
+            old_token = redis_client.get(old_token_key)
+            if old_token:
+                redis_client.delete(f"password_reset:{old_token.decode()}")
+            redis_client.delete(old_token_key)
+        redis_client.setex(block_key, 60, "blocked")
+        redis_client.delete(attempts_key)
+        response = {"message": "If an account exists, a password reset link has been sent."}
+        return JSONResponse(status_code=status.HTTP_200_OK, content=response)
+      
+      current_attempts = redis_client.incr(attempts_key)
+      if current_attempts == 1:
+        redis_client.expire(attempts_key, 60)
+        
       user = db.query(User).filter(User.email == data.email).first()
       response = {"message": "If an account exists, a password reset link has been sent."}
       if user is None:
           return JSONResponse(status_code=status.HTTP_200_OK, content=response)
       else:
+            old_token_key = f"password_reset_user:{user.id}"
+            old_token = redis_client.get(old_token_key)
+
+            if old_token:
+                redis_client.delete(f"password_reset:{old_token.decode()}")
+                logger.info(f"Deleted old password reset token for user_id={user.id}")
+
+
+
             token = secrets.token_urlsafe(32)
 
             redis_client.setex(
                 f"password_reset:{token}",
-                900, 
+                120, 
                 user.id
             )
+
+            redis_client.setex(
+            f"password_reset_user:{user.id}",
+            120,
+            token
+        )
             reset_link = f"http://localhost:8000/api/v1/reset/password/{token}"
             send_password_reset_email(user.email, reset_link)
+            
             return JSONResponse(status_code=status.HTTP_200_OK, content=response)
     
 
@@ -314,6 +357,9 @@ async def reset_password(token: str, password: ResetPasswordRequest, db: Session
             redis_client.delete(f"otp_{user_id}")
             redis_client.delete(f"login_attempts:{user_id}")
             redis_client.delete(f"lock_user:{user_id}")
+            redis_client.delete(f"password_reset_attempts:{user.email}")
+            redis_client.delete(f"password_reset_block:{user.email}")
+            redis_client.delete(f"password_reset_user:{user.id}")
             
             return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "Password reset successful"})
         except SQLAlchemyError as e:
